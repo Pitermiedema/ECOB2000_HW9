@@ -1,0 +1,496 @@
+---
+title: "Lab 8: Logit and Probit Models of Spousal Age Gaps"
+author: "Piter Miedema"
+date: "2026-11-09"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 8, fig.height = 4.5)
+```
+
+```{r packages}
+library(ggplot2)
+library(tidyverse)
+library(haven)
+library(knitr)
+library(modelsummary)
+
+theme_set(theme_minimal(base_size = 12))
+pal <- c("#2a6fdb", "#d1495b", "#00a6a6", "#edae49")
+```
+
+## The question
+
+**What predicts whether a husband is more than 5 years older than his wife?**
+
+In Lab 7 I estimated this with OLS. Here I estimate the same models with **logit** and **probit** and ask which variables actually help predict.
+
+## Data and sample
+
+```{r data}
+load("~/Downloads/ACS2021_couples.RData")
+
+race_labels <- c("White" = "1", "Black" = "2",
+                 "American Indian or Alaska Native" = "3",
+                 "Chinese" = "4", "Japanese" = "5",
+                 "Other Asian or Pacific Islander" = "6",
+                 "Other race" = "7", "two races" = "8", "three races" = "9")
+hisp_labels <- c("Not Hispanic" = "0", "Mexican" = "1", "Puerto Rican" = "2",
+                 "Cuban" = "3", "Other" = "4")
+acs2021_couples$RACE     <- fct_recode(as.factor(acs2021_couples$RACE), !!!race_labels)
+acs2021_couples$h_race   <- fct_recode(as.factor(acs2021_couples$h_race), !!!race_labels)
+acs2021_couples$HISPAN   <- fct_recode(as.factor(acs2021_couples$HISPAN), !!!hisp_labels)
+acs2021_couples$h_hispan <- fct_recode(as.factor(acs2021_couples$h_hispan), !!!hisp_labels)
+
+# variables my copy of the data is missing
+acs2021_couples$age_diff <- acs2021_couples$AGE - acs2021_couples$h_age
+educ_years <- c("N/A or no schooling" = 0, "Nursery school to grade 4" = 3,
+                "Grade 5, 6, 7, or 8" = 7.5, "Grade 9" = 9, "Grade 10" = 10,
+                "Grade 11" = 11, "Grade 12" = 12, "1 year of college" = 13,
+                "2 years of college" = 14, "3 years of college" = 15,
+                "4 years of college" = 16, "5+ years of college" = 18)
+acs2021_couples$educ_numeric <- unname(educ_years[as.character(acs2021_couples$EDUC)])
+acs2021_couples <- acs2021_couples %>%
+  mutate(educ_hs       = as.numeric(educ_numeric == 12),
+         educ_somecoll = as.numeric(educ_numeric %in% c(13, 14, 15)),
+         educ_college  = as.numeric(educ_numeric == 16),
+         educ_advdeg   = as.numeric(educ_numeric == 18))
+
+# traditional couples: she is the spouse, he is the householder (h_sex 1 = Male)
+trad_data <- acs2021_couples %>% filter(SEX == "Female", h_sex == 1)
+trad_data$REGION <- as_factor(trad_data$REGION)
+
+trad_data$he_more_than_5yrs_than_her <- as.numeric(trad_data$age_diff < -5)
+
+# extra predictors
+trad_data <- trad_data %>%
+  mutate(her_foreign  = as.numeric(BPL >= 150),        # born outside the US
+         his_foreign  = as.numeric(h_bpl >= 150),
+         diff_race    = as.numeric(RACE != h_race),
+         in_metro     = as.numeric(MET2013 != 0),
+         food_stamps  = as.numeric(FOODSTMP == 2),
+         no_insurance = as.numeric(HCOVANY == 1),
+         commute_min  = as.numeric(TRANTIME),
+         kids_under5  = as.numeric(NCHLT5 > 0),
+         # silly variables
+         mobile_home  = as.numeric(UNITSSTR == 1),
+         no_heat_fuel = as.numeric(FUELHEAT == 1),
+         walks_to_work = as.numeric(TRANWORK == 60),
+         veteran      = as.numeric(VETSTAT == 2))
+
+y <- trad_data$he_more_than_5yrs_than_her
+```
+
+The sample is every married couple where the wife is the spouse and the husband is the
+householder: **`r format(nrow(trad_data), big.mark = ",")` couples**. In
+**`r round(100 * mean(y), 1)`%** of them he is more than 5 years older.
+
+Checking which value is 1 (it should be only the couples where `age_diff` is below −5):
+
+```{r check}
+table(y, cut(trad_data$age_diff, c(-100, -10, -5, 0, 5, 10, 100))) %>%
+  as.data.frame.matrix() %>%
+  `rownames<-`(c("0: not", "1: he is >5 yrs older")) %>%
+  kable(format.args = list(big.mark = ","),
+        caption = "Her age minus his age, by outcome")
+```
+
+All the 1s fall in the two left columns, so a positive coefficient means *more likely that he
+is more than 5 years older*. The 0s in the (−10, −5] column are couples exactly 5 years apart,
+which correctly count as "not more than 5".
+
+## Models
+
+I estimate four logit specifications, each adding a group of variables:
+
+| Model | Adds |
+|---|---|
+| 1 | Her education (dummies, vs. less than high school) and her age — the professor's model |
+| 2 | Race, Hispanic origin, born abroad (each spouse), different-race couple, metro area, region |
+| 3 | Model 2 plus four "silly" variables: lives in a mobile home, uses no heating fuel, walks to work, she is a veteran |
+| 4 | Model 2 plus hardship and daily life: food stamps, no health insurance, commute time, kids under 5 |
+
+```{r models, cache=TRUE}
+f1 <- he_more_than_5yrs_than_her ~ educ_hs + educ_somecoll + educ_college + educ_advdeg + AGE
+f2 <- update(f1, . ~ . + RACE + HISPAN + her_foreign + his_foreign + diff_race + in_metro + REGION)
+f3 <- update(f2, . ~ . + mobile_home + no_heat_fuel + walks_to_work + veteran)
+f4 <- update(f2, . ~ . + food_stamps + no_insurance + commute_min + kids_under5)
+
+logit1 <- glm(f1, data = trad_data, family = binomial)
+logit2 <- glm(f2, data = trad_data, family = binomial)
+logit3 <- glm(f3, data = trad_data, family = binomial)
+logit4 <- glm(f4, data = trad_data, family = binomial)
+```
+
+### Coefficients
+
+Logit coefficients are changes in the log-odds. The table shows **odds ratios**
+(exp(coefficient)): above 1 means more likely, below 1 less likely. For example, 0.5 means
+half the odds. Region dummies and the smaller race and Hispanic-origin categories are
+estimated but left out of the table to keep it readable.
+
+```{r coef-table}
+coef_names <- c(
+  "educ_hs" = "High school", "educ_somecoll" = "Some college",
+  "educ_college" = "Bachelor's", "educ_advdeg" = "Advanced degree",
+  "AGE" = "Her age (per year)",
+  "RACEBlack" = "Black", "RACEChinese" = "Chinese", "RACEJapanese" = "Japanese",
+  "RACEOther Asian or Pacific Islander" = "Other Asian / Pacific Islander",
+  "HISPANMexican" = "Mexican", "her_foreign" = "She was born abroad",
+  "his_foreign" = "He was born abroad", "diff_race" = "Different-race couple",
+  "in_metro" = "Lives in a metro area", "food_stamps" = "Gets food stamps",
+  "no_insurance" = "No health insurance", "commute_min" = "Commute (per minute)",
+  "kids_under5" = "Has kids under 5",
+  "mobile_home" = "Lives in a mobile home", "no_heat_fuel" = "Uses no heating fuel",
+  "walks_to_work" = "Walks to work", "veteran" = "She is a veteran")
+
+modelsummary(list("Model 1" = logit1, "Model 2" = logit2,
+                  "Model 3" = logit3, "Model 4" = logit4),
+             exponentiate = TRUE, coef_map = coef_names,
+             stars = TRUE, gof_map = c("nobs", "aic"), fmt = 2)
+```
+
+```{r odds-plot, fig.height=5.5}
+broom::tidy(logit4, conf.int = TRUE, exponentiate = TRUE) %>%
+  filter(term %in% names(coef_names), term != "AGE", term != "commute_min") %>%
+  mutate(label = fct_reorder(coef_names[term], estimate)) %>%
+  ggplot(aes(estimate, label)) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey50") +
+  geom_pointrange(aes(xmin = conf.low, xmax = conf.high), colour = pal[1]) +
+  scale_x_log10() +
+  labs(x = "Odds ratio (log scale): right of 1 = more likely he is >5 yrs older",
+       y = NULL, title = "What raises and lowers the odds (Model 4)")
+```
+
+**What the coefficients say:**
+
+* **Education has large effects.** In Model 1 an advanced degree cuts the odds roughly
+  in half compared with less than high school.
+* **Background matters a lot.** Women born abroad have about 60% higher odds, and couples of
+  different races about 30% higher. Black wives have higher odds than white wives, and
+  Chinese and Japanese wives lower odds. Mexican-origin wives have lower odds than
+  non-Hispanic wives.
+* **The education effects shrink from Model 1 to Model 2.** Part of the education "effect" in
+  Model 1 was really background, for example because less-educated women are more often
+  immigrants. This is omitted variable bias.
+* **Young kids:** couples with a child under 5 have much *lower* odds. This is not a cause
+  (see the exogeneity section below).
+
+## OLS vs. logit vs. probit
+
+Using the Model 2 variables, I estimate all three and compare them. Logit and probit
+coefficients are on different scales, so I convert each to an **average marginal effect**:
+the average change in the *probability*, which is directly comparable to the OLS coefficient.
+
+```{r three-methods, cache=TRUE, dependson='models'}
+ols2    <- lm(f2, data = trad_data)
+probit2 <- glm(f2, data = trad_data, family = binomial(link = "probit"))
+
+# average marginal effect = mean slope of the link function x coefficient
+ame <- function(m) {
+  xb <- predict(m, type = "link")
+  dens <- if (m$family$link == "logit") dlogis(xb) else dnorm(xb)
+  mean(dens) * coef(m)
+}
+
+show_terms <- c("educ_college", "educ_advdeg", "AGE", "RACEBlack", "HISPANMexican",
+                "her_foreign", "diff_race")
+tibble(Variable = coef_names[show_terms],
+       OLS      = coef(ols2)[show_terms],
+       Logit    = ame(logit2)[show_terms],
+       Probit   = ame(probit2)[show_terms]) %>%
+  mutate(across(OLS:Probit, ~ sprintf("%+.1f pts", 100 * .x))) %>%
+  kable(align = "lrrr",
+        caption = "Change in probability (percentage points), Model 2 variables")
+```
+
+The three methods tell the same story: the marginal effects are within about a percentage
+point of each other.
+
+```{r pred-compare, fig.height=4.5}
+preds <- tibble(OLS    = fitted(ols2),
+                Logit  = fitted(logit2),
+                Probit = fitted(probit2))
+
+set.seed(1)
+preds %>% slice_sample(n = 8000) %>%
+  pivot_longer(c(OLS, Probit), names_to = "method", values_to = "pred") %>%
+  ggplot(aes(Logit, pred, colour = method)) +
+  geom_abline(linetype = "dashed", colour = "grey50") +
+  geom_point(alpha = 0.25, size = 0.8) +
+  scale_colour_manual(values = pal[c(2, 3)]) +
+  labs(x = "Logit predicted probability", y = "Other method's prediction", colour = NULL,
+       title = "Predicted probabilities, one dot per couple (random 8,000)")
+```
+
+Probit and logit predictions are almost identical (correlation
+`r round(cor(preds$Logit, preds$Probit), 4)`). OLS agrees in the middle (correlation
+`r round(cor(preds$Logit, preds$OLS), 3)`) but drifts apart at the ends, most of all for the couples
+with the highest predicted probabilities, where the logit curve bends and the OLS straight
+line can't. OLS predictions range from
+`r sprintf("%.2f", min(preds$OLS))` to `r sprintf("%.2f", max(preds$OLS))`, so here no
+prediction falls outside 0–1, but nothing in OLS prevents it.
+
+## From probabilities to predictions
+
+Each model gives every couple a *probability*. To compare predictions with the truth I need a
+yes/no guess, so I pick a **cutoff**: predict "yes" if the probability is above it. Following
+the lab, I first use the average predicted probability as the cutoff.
+
+```{r confusion}
+# share correct, share of real 1s caught, share of real 0s wrongly flagged
+scores <- function(p, y, cutoff = mean(p)) {
+  guess <- p > cutoff
+  c(Accuracy        = mean(guess == y),
+    `1s caught`     = mean(guess[y == 1]),
+    `0s flagged`    = mean(guess[y == 0]),
+    `Predicted yes` = mean(guess))
+}
+
+all_preds <- list("OLS (Model 2)"    = fitted(ols2),
+                  "Probit (Model 2)" = fitted(probit2),
+                  "Logit Model 1"    = fitted(logit1),
+                  "Logit Model 2"    = fitted(logit2),
+                  "Logit Model 3"    = fitted(logit3),
+                  "Logit Model 4"    = fitted(logit4))
+
+# area under the ROC curve: chance the model ranks a random 1 above a random 0
+auc <- function(p, y) {
+  r <- rank(p); n1 <- as.numeric(sum(y == 1)); n0 <- as.numeric(sum(y == 0))
+  (sum(r[y == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+
+map_dfr(all_preds, ~ c(scores(.x, y), AUC = auc(.x, y)), .id = "Model") %>%
+  mutate(across(Accuracy:`Predicted yes`, ~ sprintf("%.1f%%", 100 * .x)),
+         AUC = sprintf("%.3f", AUC)) %>%
+  kable(align = "lrrrrr",
+        caption = "Prediction quality, cutoff = average predicted probability")
+```
+
+How to read the columns:
+
+* **1s caught:** of the couples where he really is >5 years older, the share the model flags.
+* **0s flagged:** of the couples where he isn't, the share the model wrongly flags (false alarms).
+* **AUC:** the chance the model gives a higher probability to a random "yes" couple than to a
+  random "no" couple. 0.5 is a coin flip, 1 is perfect.
+
+Logit Model 4 has the best accuracy, the fewest false alarms and the highest AUC (OLS
+catches slightly more real cases only because it says "yes" more often). Even so, its AUC is only
+`r sprintf("%.2f", auc(fitted(logit4), y))`. OLS, logit and probit with the same variables
+predict essentially equally well. **The choice of variables matters far more than the choice
+of method.**
+
+A useful benchmark: guessing "no" for everyone is right
+**`r round(100 * (1 - mean(y)), 1)`%** of the time, higher than any model's accuracy at this
+cutoff. Accuracy alone is a misleading score when one outcome is much more common.
+
+### The tradeoff between false alarms and misses
+
+```{r cutoffs, fig.height=4}
+cut_grid <- seq(0.05, 0.6, by = 0.01)
+p4 <- fitted(logit4)
+map_dfr(cut_grid, ~ c(cutoff = .x, scores(p4, y, .x))) %>%
+  select(cutoff, `Real 1s caught` = `1s caught`, `Real 0s wrongly flagged` = `0s flagged`,
+         Accuracy) %>%
+  pivot_longer(-cutoff) %>%
+  ggplot(aes(cutoff, value, colour = name)) +
+  geom_line(linewidth = 1) +
+  geom_vline(xintercept = mean(p4), linetype = "dashed", colour = "grey50") +
+  annotate("text", x = mean(p4) + 0.01, y = 0.97, hjust = 0,
+           label = "average-prediction cutoff", size = 3.5, colour = "grey30") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_colour_manual(values = pal[c(4, 1, 2)]) +
+  labs(x = "Cutoff (predict 'yes' if probability is above this)", y = NULL, colour = NULL,
+       title = "Raising the cutoff: fewer false alarms, but more misses (Model 4)") +
+  theme(legend.position = "top")
+```
+
+A **low cutoff** flags almost everyone: few misses, many false alarms. A **high cutoff** flags
+almost no one. Accuracy climbs toward `r round(100 * (1 - mean(y)))`% only because the model
+stops saying "yes". At a cutoff of 0.5 the model predicts "no" for nearly every couple,
+because only `r sprintf("%.1f%%", 100 * mean(p4 > 0.5))` of predicted probabilities are
+above 0.5. The right cutoff depends on which mistake is worse; with no particular use in mind,
+the average prediction is a reasonable middle ground.
+
+```{r roc, fig.height=4.5, fig.width=5.5}
+roc_points <- function(p, y) {
+  cuts <- quantile(p, seq(0, 1, by = 0.01))
+  tibble(fpr = map_dbl(cuts, ~ mean(p[y == 0] > .x)),
+         tpr = map_dbl(cuts, ~ mean(p[y == 1] > .x)))
+}
+bind_rows(`Model 1` = roc_points(fitted(logit1), y),
+          `Model 2` = roc_points(fitted(logit2), y),
+          `Model 4` = roc_points(fitted(logit4), y), .id = "model") %>%
+  ggplot(aes(fpr, tpr, colour = model)) +
+  geom_abline(linetype = "dashed", colour = "grey60") +
+  geom_line(linewidth = 1) +
+  scale_colour_manual(values = pal[c(4, 3, 1)]) +
+  scale_x_continuous(labels = scales::percent) +
+  scale_y_continuous(labels = scales::percent) +
+  coord_equal() +
+  labs(x = "Real 0s wrongly flagged", y = "Real 1s caught", colour = NULL,
+       title = "ROC curves: every possible cutoff")
+```
+
+Each curve traces all possible cutoffs. Higher and further left is better; the dashed line is
+random guessing. Each added group of variables lifts the curve, but none comes close to the
+top-left corner.
+
+## Where is the model most confused?
+
+Model 4's performance within subgroups, at the average-prediction cutoff:
+
+```{r subgroups}
+sub_df <- trad_data %>%
+  mutate(p = p4, guess = p > mean(p4), y = y,
+         `Her education` = factor(case_when(educ_advdeg == 1 ~ "Advanced degree",
+                                            educ_college == 1 ~ "Bachelor's",
+                                            educ_somecoll == 1 ~ "Some college",
+                                            educ_hs == 1 ~ "High school",
+                                            TRUE ~ "Less than high school"),
+                                  levels = c("Less than high school", "High school",
+                                             "Some college", "Bachelor's", "Advanced degree")),
+         `Her race` = fct_collapse(RACE,
+                                   "White" = "White", "Black" = "Black",
+                                   "Asian or Pacific Islander" = c("Chinese", "Japanese",
+                                                                   "Other Asian or Pacific Islander"),
+                                   "Two or more races" = c("two races", "three races"),
+                                   other_level = "Other"),
+         `Born abroad` = ifelse(her_foreign == 1, "She was born abroad", "She was born in the US"),
+         `Her age` = cut(AGE, c(0, 34, 49, 64, 120),
+                         labels = c("Under 35", "35-49", "50-64", "65+")))
+
+sub_scores <- map_dfr(c("Her education", "Her race", "Born abroad", "Her age"), function(g) {
+  sub_df %>%
+    group_by(group = .data[[g]]) %>%
+    summarise(n = n(),
+              `Actual share yes` = mean(y),
+              Accuracy = mean(guess == y),
+              `1s caught` = mean(guess[y == 1]),
+              `0s flagged` = mean(guess[y == 0])) %>%
+    filter(!is.na(group)) %>%   # a few records have an implausible age of 0
+    mutate(Variable = g, .before = 1)
+})
+
+sub_scores %>%
+  mutate(n = format(n, big.mark = ","),
+         across(`Actual share yes`:`0s flagged`, ~ sprintf("%.0f%%", 100 * .x))) %>%
+  kable(col.names = c("Split by", "Group", "Couples", "Actual share yes",
+                      "Accuracy", "1s caught", "0s flagged"),
+        align = "llrrrrr", caption = "Model 4 performance by subgroup")
+```
+
+```{r subgroup-plot, fig.height=5}
+sub_scores %>%
+  mutate(label = fct_rev(fct_inorder(as.character(group)))) %>%
+  select(Variable, label, `1s caught`, `0s flagged`) %>%
+  pivot_longer(c(`1s caught`, `0s flagged`)) %>%
+  ggplot(aes(value, label, colour = name)) +
+  geom_line(aes(group = label), colour = "grey80", linewidth = 1.5) +
+  geom_point(size = 2.5) +
+  facet_grid(Variable ~ ., scales = "free_y", space = "free_y") +
+  scale_colour_manual(values = pal[c(2, 1)]) +
+  scale_x_continuous(labels = scales::percent) +
+  labs(x = NULL, y = NULL, colour = NULL,
+       title = "The model mostly sorts groups instead of individuals") +
+  theme(legend.position = "top", strip.text.y = element_text(angle = 0))
+```
+
+The pattern: the model mostly sorts couples *by group*. For groups with high predicted
+probabilities (women born abroad, women without a high school diploma, Asian and
+Pacific Islander women), it flags most of the group, so it catches most real cases but also
+raises false alarms for most of the 0s. For low-probability groups (college graduates,
+women 65+) it flags few couples and misses most real cases. The model is most confused for
+women born abroad: it flags almost all of them, so accuracy there is only about 35%. Within a
+group it has much less ability to tell couples apart, because most of the variables in the
+model describe which group a couple belongs to, not the couple itself.
+
+## Which variables earn their place?
+
+To see how much each variable adds, I drop it from Model 4 (and the silly variables from
+Model 3) one at a time and check how much worse the fit gets. A bigger increase in AIC means a
+more useful variable. Factors such as race or region are dropped as a whole.
+
+```{r drop1, fig.height=5, cache=TRUE, dependson='models'}
+d4 <- drop1(logit4)
+d3 <- drop1(logit3, scope = ~ mobile_home + no_heat_fuel + walks_to_work + veteran)
+drop_aic <- bind_rows(
+  tibble(term = rownames(d4), dAIC = d4$AIC - AIC(logit4)),
+  tibble(term = rownames(d3), dAIC = d3$AIC - AIC(logit3))) %>%
+  filter(term != "<none>")
+
+nice <- c(coef_names, RACE = "Her race", HISPAN = "Hispanic origin", REGION = "Region")
+
+drop_aic %>%
+  mutate(label = fct_reorder(coalesce(nice[term], term), dAIC),
+         kind = ifelse(term %in% c("mobile_home", "no_heat_fuel", "walks_to_work", "veteran"),
+                       "Silly (Model 3)", "Model 4")) %>%
+  ggplot(aes(dAIC, label, fill = kind)) +
+  geom_col() +
+  scale_fill_manual(values = pal[c(1, 4)]) +
+  scale_x_continuous(labels = scales::comma) +
+  labs(x = "How much worse AIC gets when the variable is dropped", y = NULL, fill = NULL,
+       title = "Most useful predictors")
+```
+
+```{r aic-table}
+tibble(Model = paste("Logit Model", 1:4),
+       `Coefficients` = map_int(list(logit1, logit2, logit3, logit4), ~ length(coef(.x))),
+       AIC = map_dbl(list(logit1, logit2, logit3, logit4), AIC)) %>%
+  mutate(`Change vs Model 2` = AIC - AIC(logit2),
+         across(c(AIC, `Change vs Model 2`), ~ round(.x))) %>%
+  kable(format.args = list(big.mark = ","),
+        caption = "Model fit (lower AIC is better)")
+```
+
+* **Most useful:** her age by far, then kids under 5, being born abroad, a college or
+  advanced degree, and food stamps.
+* **Little value:** metro area, commute time and no health insurance add comparatively little
+  (no insurance least of all).
+* **The silly variables:** together they lower AIC by only about 120 (Model 3 vs Model 2),
+  compared with about 1,790 for Model 4's variables. Living in a mobile home does most of
+  that: it raises the odds by about 20%, most likely as a proxy for low income. Being a
+  veteran adds a little, and heating fuel and walking to work add essentially nothing.
+  With 400,000 couples even tiny effects get significance stars, so stars alone don't show
+  that a variable is useful.
+
+## Are these variables exogenous?
+
+Prediction and causation are different questions. A variable can predict well while being a
+*result* of the marriage, not a cause of the age gap.
+
+| Variable | Exogenous? | Why |
+|---|---|---|
+| Race, Hispanic origin, born abroad | Mostly yes | Fixed before marriage |
+| Her age | Yes, but tricky | It's her *current* age, so it mixes generations with which marriages last |
+| Her education | Mostly | Usually finished before marriage, but some women stop or return to school because of marriage |
+| Region, metro area | Partly | Couples choose where to live, possibly together after marrying |
+| Kids under 5 | **No** | Having a toddler depends partly on the age gap (an older husband), not the other way round: reverse causation |
+| Food stamps, no insurance | **No** | Household outcomes that depend on both spouses' jobs and ages; an older husband may be retired |
+| Mobile home, no heating fuel, walks to work | **No** | Proxies for income and climate, not causes |
+| She is a veteran | Mostly yes | Usually served before marrying, but there's no obvious reason it would cause an age gap |
+
+I deliberately left out **his age**, **`age_diff`** and **his work hours**. The outcome is built
+from the first two, and his hours largely reflect his age (older husbands are more often
+retired). Including them would "predict" well while learning nothing.
+
+## Conclusions
+
+* About `r round(100 * mean(y))`% of traditional married couples have a husband more than 5
+  years older. Her education, her age and immigrant background are the strongest predictors.
+* **Logit, probit and OLS agree closely**: marginal effects match within about a point, and they
+  predict equally well. Logit and probit are guaranteed to keep predictions between 0 and 1,
+  but in this sample OLS never left that range either.
+* **Adding the right variables matters more than the method.** Background variables raised
+  the AUC noticeably; silly variables (mobile home, heating fuel, walking to work, veteran) added almost nothing.
+* **Prediction remains weak** (AUC about `r sprintf("%.2f", auc(p4, y))`). The model sorts
+  couples into higher- and lower-probability groups but can't tell couples apart within a
+  group. Who marries whom depends mostly on things the census doesn't measure.
+* The variables Model 4 adds that improve prediction most, young kids and food stamps, are the
+  least causal. They are results of the marriage, not reasons for the age gap.
